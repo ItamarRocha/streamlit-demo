@@ -4,6 +4,9 @@ import pandas as pd
 import numpy as np
 import io
 
+# Set page config FIRST
+st.set_page_config(layout="wide")
+
 # --- Configuration ---
 # Removed hardcoded file paths
 PASSWORD = "hbass12345"  # Simple password protection
@@ -12,8 +15,8 @@ ADVANCE_THRESHOLD = 100
 # --- Helper Functions ---
 
 
-# Use allow_output_mutation=True for caching mutable objects like DataFrames
-@st.cache(allow_output_mutation=True)
+# Use st.cache_data for caching data/DataFrames
+@st.cache_data
 def process_and_merge_data(results_list, original_df):
     """Process JSON results and merge with original CSV DataFrame."""
     if not results_list or original_df is None:
@@ -210,7 +213,6 @@ def check_password():
 
 
 # --- Streamlit App Main Logic ---
-st.set_page_config(layout="wide")  # Set layout to wide *once* at the top
 
 if not check_password():
     st.stop()  # Stop execution if password is not correct
