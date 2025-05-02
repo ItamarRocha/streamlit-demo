@@ -5,72 +5,42 @@ import numpy as np
 import io
 
 # --- Configuration ---
-# RESULTS_FILE = "analysis/results_final.json" # Removed
-# ORIGINAL_CSV_FILE = "cleaned_df_new.csv" # Removed
+# Removed hardcoded file paths
 PASSWORD = "hbass12345"  # Simple password protection
 ADVANCE_THRESHOLD = 100
 
 # --- Helper Functions ---
 
-# Removed load_data function, parsing will happen directly from upload
 
-
-# Use allow_output_mutation=True for DataFrames
+# Use allow_output_mutation=True for caching mutable objects like DataFrames
 @st.cache(allow_output_mutation=True)
-def process_data(results_list):
-    """Process loaded JSON data (list of dicts) into a pandas DataFrame."""
-    if not results_list:
+def process_and_merge_data(results_list, original_df):
+    """Process JSON results and merge with original CSV DataFrame."""
+    if not results_list or original_df is None:
+        st.error("Missing results list or original DataFrame for processing.")
         return None
 
-    processed = []
-    diversity_scores_list = []
-
-    # Filter out entries with errors or missing evaluation first
+    # Filter valid results from JSON list
     valid_results = [
         r for r in results_list if r.get("status") == "success" and r.get("evaluation")
     ]
     if not valid_results:
-        st.warning("No valid evaluation results found in the uploaded file.")
+        st.warning("No valid evaluation results found in the uploaded JSON file.")
         return None
+
+    processed_results = []
+    diversity_scores_list = []
 
     for result in valid_results:
         eval_data = result.get("evaluation", {})
-        # --- Attempt to Get Original Demographic Strings ---
-        # **ASSUMPTION**: Original info might be nested. Adjust keys if needed.
-        # Example: Try finding original input within the result structure.
-        # We are removing the explicit CSV dependency for the upload version.
-        original_info = result.get("original_input_info", {})  # Placeholder key
-        if not original_info:
-            # Fallback if 'original_input_info' doesn't exist - maybe it's top level?
-            original_info = result
-
         composite_score = eval_data.get("FinalCompositeScore", {})
         threshold_check = eval_data.get("AcademicThresholdCheck", {})
         diversity_eval = eval_data.get("DiversityEvaluation", {})
         diversity_details = diversity_eval.get("CriteriaDetails", {})
 
-        # --- Map Original Demographic Strings ---
-        # **CRITICAL**: These keys MUST exist somewhere within each `result` dictionary in the uploaded JSON.
-        demographic_mapping = {
-            "Gender_Category": "Gender Identity",  # Example key in original_info
-            "Ethnicity_Category": "Ethnicity",
-            "Orientation_Category": "Sexual Orientation",
-            "Region_Category": "State of Origin",
-            "Income_Category": "Childhood Family Income",
-            "Schooling_Category": "Primary Education Type",
-            "HigherEducation_Category": "Higher Education Type",
-        }
-        demographic_data = {}
-        found_demographics = False
-        for new_col, old_key in demographic_mapping.items():
-            value = original_info.get(old_key, "Unknown")
-            demographic_data[new_col] = value
-            if value != "Unknown":
-                found_demographics = True
-
         processed_entry = {
-            "ID": result.get("id", "N/A"),  # Keep ID if available
-            "Name": result.get("name", "N/A"),
+            "ID": result.get("id", "N/A"),  # Keep ID for merging
+            "Name_Eval": result.get("name", "N/A"),  # Use a distinct name temporarily
             "Total Score": composite_score.get("TotalScore", None),
             "Academic Score": threshold_check.get("ApplicantScore", None),
             "Diversity Score_Overall": diversity_eval.get("RawScore", None),
@@ -79,50 +49,133 @@ def process_data(results_list):
                 "PassAcademicThreshold", None
             ),
             "Raw Evaluation": eval_data,
-            **demographic_data,  # Add the extracted demographic data
         }
-        processed.append(processed_entry)
+        processed_results.append(processed_entry)
 
-        # Extract individual diversity scores
         diversity_scores_entry = {
             k: v.get("score") for k, v in diversity_details.items()
         }
-        # Need a way to link these scores back if ID isn't reliable or consistent
-        # Using index for now, assuming order is preserved
+        diversity_scores_entry["ID"] = result.get("id", "N/A")
         diversity_scores_list.append(diversity_scores_entry)
 
-    if not found_demographics:
-        st.warning(
-            "Warning: Could not find expected demographic fields in the uploaded JSON. Demographic statistics may be inaccurate or unavailable."
+    results_df = pd.DataFrame(processed_results)
+    diversity_scores_df = pd.DataFrame(diversity_scores_list)
+
+    # Ensure ID is numeric for merging
+    results_df["ID"] = pd.to_numeric(results_df["ID"], errors="coerce")
+    diversity_scores_df["ID"] = pd.to_numeric(
+        diversity_scores_df["ID"], errors="coerce"
+    )
+    results_df = results_df.dropna(subset=["ID"])
+    diversity_scores_df = diversity_scores_df.dropna(subset=["ID"])
+    results_df["ID"] = results_df["ID"].astype(int)
+    diversity_scores_df["ID"] = diversity_scores_df["ID"].astype(int)
+
+    # Merge results with original data using ID (results) and index (original_df)
+    # Assuming the 'ID' in results corresponds to the original CSV row index (0-based)
+    if not original_df.index.is_unique:
+        st.warning("Original CSV index is not unique, resetting index for merge.")
+        original_df = original_df.reset_index()
+        # If the original index was meaningful, adjust merge logic, otherwise merge on 0-based index
+
+    merged_df = pd.merge(
+        results_df, original_df, left_on="ID", right_index=True, how="inner"
+    )  # Use inner merge to keep only matched rows
+    if merged_df.empty:
+        st.error(
+            "Merge between results and original data failed. Check if IDs/indices match."
         )
+        return None
 
-    df = pd.DataFrame(processed)
+    # Merge diversity scores
+    merged_df = pd.merge(
+        merged_df, diversity_scores_df, on="ID", how="left", suffixes=("_res", "_div")
+    )  # Add suffixes if any column names clash
 
-    # Add diversity scores as columns (assuming order matches df)
-    try:
-        diversity_scores_df = pd.DataFrame(diversity_scores_list, index=df.index)
-        df = pd.concat([df, diversity_scores_df], axis=1)
-    except Exception as e:
-        st.error(f"Error merging diversity scores: {e}. Check JSON structure.")
-        # Continue without individual diversity scores if merge fails
+    # --- Map Original Demographic Strings ---
+    demographic_mapping = {
+        "Gender_Category": "Com qual dos gêneros abaixo você se identifica?",
+        "Ethnicity_Category": "Com qual das etnias abaixo você se identifica?",
+        "Orientation_Category": "Qual sua orientação sexual?",
+        "Region_Category": "Qual seu estado de origem?",
+        "Income_Category": "Durante sua infância, qual era a renda mensal bruta do seu núcleo familiar?",
+        "Schooling_Category": "Como você realizou/está realizando seus estudos de Ensino Fundamental ou equivalente?",
+        "HigherEducation_Category": "Se você cursa ou já cursou ensino superior, como você realizou seus estudos?",
+        "Name": "Nome completo",  # Get definitive name from CSV
+    }
+
+    for new_col, old_col in demographic_mapping.items():
+        if old_col in merged_df.columns:
+            merged_df[new_col] = merged_df[old_col]
+        else:
+            st.warning(
+                f"Warning: Column '{old_col}' not found in original CSV for mapping to '{new_col}'. Statistics might be incomplete."
+            )
+            merged_df[new_col] = "Unknown"
 
     # Ensure numeric columns are numeric, coercing errors
-    # Infer numeric columns dynamically if possible, but be explicit for core scores
-    numeric_cols = ["Total Score", "Academic Score", "Diversity Score_Overall"] + list(
-        diversity_details.keys()
-    )
+    div_score_cols = list(diversity_scores_df.drop(columns="ID").columns)
+    numeric_cols = [
+        "Total Score",
+        "Academic Score",
+        "Diversity Score_Overall",
+    ] + div_score_cols
     for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+        if col in merged_df.columns:
+            merged_df[col] = pd.to_numeric(merged_df[col], errors="coerce")
 
     # Sort by Total Score and add Rank/Advance columns
-    df = df.sort_values(
+    merged_df = merged_df.sort_values(
         by="Total Score", ascending=False, na_position="last"
     ).reset_index(drop=True)
-    df["Rank"] = range(1, len(df) + 1)
-    df["Advance to Top 100"] = df["Rank"] <= ADVANCE_THRESHOLD
+    merged_df["Rank"] = range(1, len(merged_df) + 1)
+    merged_df["Advance to Top 100"] = merged_df["Rank"] <= ADVANCE_THRESHOLD
 
-    return df  # Return the final combined DataFrame
+    # --- Final Column Selection and Renaming ---
+    # Define core columns from results
+    core_results_cols = [
+        "ID",
+        "Total Score",
+        "Academic Score",
+        "Diversity Score_Overall",
+        "Summary",
+        "Pass Academic Threshold",
+        "Raw Evaluation",
+        "Rank",
+        "Advance to Top 100",
+    ]
+    # Define demographic category columns created from mapping
+    demographic_category_cols = list(
+        demographic_mapping.keys()
+    )  # Includes 'Name' mapped from CSV
+    # Define diversity score columns (excluding ID)
+    div_score_cols = [col for col in diversity_scores_df.columns if col != "ID"]
+
+    # Combine all desired columns
+    final_columns_list = core_results_cols + demographic_category_cols + div_score_cols
+
+    # Filter out columns that might not exist if merge failed partially
+    final_columns = [col for col in final_columns_list if col in merged_df.columns]
+    final_df = merged_df[final_columns].copy()
+
+    # Ensure the 'Name' column is the one from the CSV mapping
+    # If 'Name' is not in final_columns (because mapping failed), handle it
+    if "Name" not in final_df.columns:
+        st.warning(
+            "Could not find definitive 'Name' column from CSV. Using name from results JSON."
+        )
+        if "Name_Eval" in merged_df.columns:
+            final_df["Name"] = merged_df["Name_Eval"]
+        else:
+            final_df["Name"] = "Unknown"
+
+    # Drop any potentially ambiguous name columns if they exist by mistake
+    if "Name_Eval" in final_df.columns and "Name" in final_df.columns:
+        final_df = final_df.drop(columns=["Name_Eval"])
+    if "Nome completo" in final_df.columns and "Name" in final_df.columns:
+        final_df = final_df.drop(columns=["Nome completo"])
+
+    return final_df
 
 
 # --- Password Check ---
@@ -164,54 +217,78 @@ if not check_password():
 
 # --- File Upload and Data Loading ---
 
-# Initialize session state if not already done
+# Initialize session state
 if "data_loaded" not in st.session_state:
     st.session_state.data_loaded = False
 if "df" not in st.session_state:
     st.session_state.df = None
 
-uploaded_file = st.file_uploader(
-    "Choose a JSON results file",
-    type="json",
-    accept_multiple_files=False,
-    key="file_uploader",
+st.sidebar.header("Upload Data Files")
+uploaded_json = st.sidebar.file_uploader(
+    "1. Upload Results JSON File", type="json", key="json_uploader"
 )
 
-if uploaded_file is not None:
-    # Check if we need to reload/reprocess or if it's the same file
-    # Simple approach: always reload if a file is present
-    try:
-        # Read content
-        stringio = io.StringIO(uploaded_file.getvalue().decode("utf-8"))
-        results_list = json.load(stringio)
+uploaded_csv = st.sidebar.file_uploader(
+    "2. Upload Original CSV File", type="csv", key="csv_uploader"
+)
 
-        # Process data
-        processed_df = process_data(results_list)
-        if processed_df is not None:
-            st.session_state.df = processed_df
-            st.session_state.data_loaded = True
-            st.success("File loaded and processed successfully!")
-            # Optional: Clear the uploader after successful processing to prevent reprocessing on every interaction
-            # st.session_state.file_uploader = None # Doesn't work directly like this
-            # Consider using a button to trigger processing instead of automatic rerun
-        else:
-            st.session_state.data_loaded = (
-                False  # Ensure flag is false if processing fails
-            )
-            st.error(
-                "Failed to process the uploaded JSON file. Please check the file structure and content."
-            )
+# Process data only if both files are uploaded
+if uploaded_json is not None and uploaded_csv is not None:
+    # Check if files have changed since last processing run
+    # Simple check based on upload status (can be made more robust with file hashing if needed)
+    if (
+        not st.session_state.data_loaded
+        or st.session_state.get("last_json_name") != uploaded_json.name
+        or st.session_state.get("last_csv_name") != uploaded_csv.name
+    ):
+        st.session_state.data_loaded = False  # Reset flag for reprocessing
+        st.session_state.df = None
+        try:
+            # Read JSON
+            stringio_json = io.StringIO(uploaded_json.getvalue().decode("utf-8"))
+            results_list = json.load(stringio_json)
 
-    except json.JSONDecodeError:
-        st.error("Invalid JSON file. Please upload a valid JSON file.")
-        st.session_state.data_loaded = False
-    except Exception as e:
-        st.error(f"An error occurred while reading or processing the file: {e}")
-        st.session_state.data_loaded = False
+            # Read CSV
+            original_df = pd.read_csv(uploaded_csv)
+
+            # Process and merge data
+            with st.spinner("Processing and merging data..."):
+                processed_df = process_and_merge_data(results_list, original_df)
+
+            if processed_df is not None:
+                st.session_state.df = processed_df
+                st.session_state.data_loaded = True
+                st.session_state.last_json_name = (
+                    uploaded_json.name
+                )  # Store names to prevent reprocessing
+                st.session_state.last_csv_name = uploaded_csv.name
+                st.success("Files loaded and processed successfully!")
+                # Rerun needed to update pages with the new data in session state
+                try:
+                    st.rerun()
+                except AttributeError:
+                    st.experimental_rerun()
+            else:
+                st.error(
+                    "Failed to process the uploaded files. Please check structure and content."
+                )
+
+        except json.JSONDecodeError:
+            st.error("Invalid JSON file. Please upload a valid JSON file.")
+        except Exception as e:
+            st.error(f"An error occurred while reading or processing the files: {e}")
+
+elif uploaded_json is not None or uploaded_csv is not None:
+    st.sidebar.warning("Please upload both the JSON and CSV files.")
+    st.session_state.data_loaded = (
+        False  # Ensure flag is false if only one file is uploaded
+    )
 
 # --- Display Welcome/Guidance or Page Content ---
-if not st.session_state.data_loaded:
-    st.info("Please upload the evaluation results JSON file to view the dashboard.")
+if not st.session_state.data_loaded or st.session_state.df is None:
+    st.info(
+        "Please upload the evaluation results JSON and the original candidate CSV files in the sidebar to view the dashboard."
+    )
     st.stop()  # Don't proceed if data isn't loaded
 
 # If data is loaded, Streamlit will automatically show the page navigation
